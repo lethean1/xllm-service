@@ -601,6 +601,27 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<RequestContext> req_context) {
   });
 }
 
+// Strategy interface for SLO update
+// This function determines the new SLO values based on the request state and failure stage.
+// It acts as a placeholder/hook for future complex SLO adjustment logic.
+static void update_slo_for_retry(llm::proto::CompletionRequest& req_pb,
+                                 const std::shared_ptr<RequestContext>& req_context) {
+    bool is_decode_failure = req_context->request()->num_generated_tokens > 0;
+    
+    if (is_decode_failure) {
+        // Strategy for decode failure
+        // Example: Relax TPOT SLO or keep existing?
+        // Current implementation is a placeholder interface.
+        // Implement logic here to calculate new tpot_slo_ms or ttlt_slo_ms
+        // e.g., req_pb.set_tpot_slo_ms(new_value);
+    } else {
+        // Strategy for prefill failure
+        // Example: Relax TTFT SLO?
+        // Implement logic here to calculate new ttft_slo_ms
+        // e.g., req_pb.set_ttft_slo_ms(new_value);
+    }
+}
+
 void XllmHttpServiceImpl::rehandle(std::shared_ptr<RequestContext> req_context) {
   scheduler_->finish_request(req_context->request()->service_request_id);
 
@@ -612,6 +633,9 @@ void XllmHttpServiceImpl::rehandle(std::shared_ptr<RequestContext> req_context) 
     req_context->finish_with_error(error);
     return;
   }
+
+  // Apply SLO update strategy before rescheduling
+  update_slo_for_retry(req_pb, req_context);
 
   if (!req_pb.prompt().empty()) {
     // select instance for request
