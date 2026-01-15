@@ -55,6 +55,9 @@ class XllmRpcServiceImpl final {
   std::vector<std::string> get_static_prefill_list(
       const std::string& decode_name);
 
+  void get_d2d_plan_for_instance(const std::string& instance_name,
+                                 proto::D2DPlanForInstance* resp);
+
  public:
   // handle generations from prefill/decode instance
   bool handle_generation(const llm::RequestOutput& request_output);
@@ -122,6 +125,11 @@ class XllmRpcService : public proto::XllmRpcService {
                          const proto::Empty* req,
                          proto::ServiceConfig* resp,
                          google::protobuf::Closure* done) override;
+
+  virtual void GetD2DPlanForInstance(google::protobuf::RpcController* cntl_base,
+                                     const proto::InstanceID* req,
+                                     proto::D2DPlanForInstance* resp,
+                                     google::protobuf::Closure* done) override;
 
  private:
   std::unique_ptr<XllmRpcServiceImpl> xllm_rpc_service_impl_;

@@ -57,11 +57,17 @@ message LatencyMetrics {
   int64 recent_max_tbt = 2;
 }
 
+message ExpertDistribution {
+  repeated int32 dims = 1;
+  repeated int32 data = 2;
+}
+
 message HeartbeatRequest {
   string name = 1;
   KvCacheEvent cache_event = 2;
   LoadMetrics load_metrics = 3;
   LatencyMetrics latency_metrics = 4;
+  ExpertDistribution expert_distribution = 5;
 }
 
 message InstanceID {
@@ -139,6 +145,29 @@ message ServiceConfig {
   bool enable_decode_response_to_service = 1;
 }
 
+message D2DTransStep {
+  string src_instance = 1;
+  int32 src_npu = 2;
+  int32 expert_id = 3;
+}
+
+message D2DNonExpertStep {
+  string src_instance = 1;
+  int32 dp_group_index = 2;
+  int32 start_npu_index = 3;
+  int32 dp_size = 4;
+}
+
+message D2DPlanForInstance {
+  string target = 1;
+  message LayerPlan {
+    int32 layer_id = 1;
+    repeated D2DTransStep steps = 2;
+    D2DNonExpertStep non_expert = 3;
+  }
+  repeated LayerPlan layers = 2;
+}
+
 service XllmRpcService {
   rpc Hello(Empty) returns (Status) {}
   rpc RegisterInstance(InstanceMetaInfo) returns (StatusCode) {}
@@ -147,9 +176,9 @@ service XllmRpcService {
   rpc GetStaticDecodeList(InstanceID) returns (InstanceIDs) {}
   rpc GetStaticPrefillList(InstanceID) returns (InstanceIDs) {}
   rpc GetConfig(Empty) returns (ServiceConfig) {}
+  rpc GetD2DPlanForInstance(InstanceID) returns (D2DPlanForInstance) {}
 
   // xllm service receive response from decode instance directly in disagg pd mode.
   // This can eliminate the cost brought by forwarding through prefill.
   rpc Generations(DisaggStreamGenerations) returns (StatusSet) {}
 }
-

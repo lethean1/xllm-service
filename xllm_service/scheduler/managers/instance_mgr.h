@@ -54,12 +54,43 @@ class InstanceMgr final {
       const std::string& instance_name);
 
   void get_load_metrics(LoadBalanceInfos* infos);
+  ExpertDistribution get_expert_distribution(
+      const std::string& instance_name);
 
   std::shared_ptr<brpc::Channel> get_channel(const std::string& instance_name);
 
   void record_load_metrics_update(const std::string& instance_name,
                                   const proto::LoadMetrics& load_metrics);
   bool upload_load_metrics();
+  void record_expert_distribution_update(
+      const std::string& instance_name,
+      const proto::ExpertDistribution& expert_distribution);
+  bool upload_expert_distribution();
+
+  struct D2DTransStep {
+    std::string src_instance;
+    int32_t src_npu;
+    int32_t expert_id;
+  };
+
+  struct D2DNonExpertStep {
+    std::string src_instance;
+    int32_t dp_group_index = -1;
+    int32_t start_npu_index = -1;
+    int32_t dp_size = 0;
+  };
+
+  struct D2DLayerPlan {
+    std::vector<D2DTransStep> expert_steps;
+    D2DNonExpertStep non_expert_step;
+    bool has_non_expert_step = false;
+  };
+
+  D2DLayerPlan compute_d2d_plan_for_layer(const std::string& target_instance_name,
+                                         int32_t layer_id);
+                                         
+  std::unordered_map<int32_t, D2DLayerPlan> compute_d2d_plan_for_instance(
+      const std::string& target_instance_name);
 
   // update the recent token latency metrics for the corresponding instance
   void update_latency_metrics(const std::string& instance_name,
@@ -90,6 +121,8 @@ class InstanceMgr final {
 
   void update_load_metrics(const etcd::Response& response,
                            const uint64_t& prefix_len);
+  void update_expert_distribution(const etcd::Response& response,
+                                  const uint64_t& prefix_len);
 
   TimePredictor& get_time_predictor(const std::string& instance_name);
 
@@ -117,10 +150,13 @@ class InstanceMgr final {
   std::unordered_map<std::string, LoadMetrics> load_metrics_;
   std::unordered_map<std::string, std::shared_ptr<brpc::Channel>>
       cached_channels_;
+  std::shared_mutex expert_dist_mutex_;
+  std::unordered_map<std::string, ExpertDistribution> expert_distributions_;
 
   std::mutex update_mutex_;
   std::unordered_map<std::string, LoadMetrics> updated_metrics_;
   std::unordered_set<std::string> removed_instance_;
+  std::unordered_map<std::string, ExpertDistribution> updated_expert_dists_;
 
   // "instance name" -> "TimePredictor" map
   std::mutex time_predictor_mutex_;

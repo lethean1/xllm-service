@@ -54,6 +54,29 @@ std::vector<std::string> XllmRpcServiceImpl::get_static_prefill_list(
   return scheduler_->get_static_prefill_list(instance_name);
 }
 
+void XllmRpcServiceImpl::get_d2d_plan_for_instance(
+    const std::string& instance_name, proto::D2DPlanForInstance* resp) {
+  auto plan = scheduler_->get_d2d_plan_for_instance(instance_name);
+  resp->set_target(instance_name);
+  for (const auto& kv : plan) {
+    auto* lp = resp->mutable_layers()->Add();
+    lp->set_layer_id(kv.first);
+    for (const auto& step : kv.second.expert_steps) {
+      auto* s = lp->mutable_steps()->Add();
+      s->set_src_instance(step.src_instance);
+      s->set_src_npu(step.src_npu);
+      s->set_expert_id(step.expert_id);
+    }
+    if (kv.second.has_non_expert_step) {
+      auto* ne = lp->mutable_non_expert();
+      ne->set_src_instance(kv.second.non_expert_step.src_instance);
+      ne->set_dp_group_index(kv.second.non_expert_step.dp_group_index);
+      ne->set_start_npu_index(kv.second.non_expert_step.start_npu_index);
+      ne->set_dp_size(kv.second.non_expert_step.dp_size);
+    }
+  }
+}
+
 bool XllmRpcServiceImpl::handle_generation(
     const llm::RequestOutput& request_output) {
   return scheduler_->handle_generation(request_output);
@@ -220,6 +243,15 @@ void XllmRpcService::GetConfig(google::protobuf::RpcController* cntl_base,
   auto config = xllm_rpc_service_impl_->get_config();
   resp->set_enable_decode_response_to_service(
       config.enable_decode_response_to_service);
+}
+
+void XllmRpcService::GetD2DPlanForInstance(
+    google::protobuf::RpcController* cntl_base,
+    const proto::InstanceID* req,
+    proto::D2DPlanForInstance* resp,
+    google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  xllm_rpc_service_impl_->get_d2d_plan_for_instance(req->name(), resp);
 }
 
 }  // namespace xllm_service

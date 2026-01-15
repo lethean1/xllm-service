@@ -7,9 +7,11 @@ cc_library(
   HDRS
     instance_mgr.h
     global_kvcache_mgr.h
+    d2d_transmission_optimizer.h
   SRCS
     instance_mgr.cpp
     global_kvcache_mgr.cpp
+    d2d_transmission_optimizer.cpp
   DEPS
     :chat_template
     :common

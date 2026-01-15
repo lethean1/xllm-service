@@ -316,6 +316,38 @@ struct CacheLocations {
   }
 };
 
+struct ExpertDistribution {
+  std::vector<int32_t> dims;
+  std::vector<int32_t> data;
+  uint64_t timestamp_ms = 0;
+
+  nlohmann::json serialize_to_json() const {
+    nlohmann::json json_val;
+    json_val["dims"] = dims;
+    json_val["data"] = data;
+    json_val["timestamp_ms"] = timestamp_ms;
+    return json_val;
+  }
+
+  std::string debug_string() const { return serialize_to_json().dump(2); }
+
+  bool parse_from_json(const std::string& json_str) {
+    try {
+      nlohmann::json json_value = nlohmann::json::parse(json_str);
+      dims = json_value.at("dims").get<std::vector<int32_t>>();
+      data = json_value.at("data").get<std::vector<int32_t>>();
+      timestamp_ms = json_value.value("timestamp_ms", uint64_t(0));
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "json str:" << json_str
+                 << ", parse to expert distribution error: " << e.what();
+      return false;
+    }
+    return true;
+  }
+
+  bool empty() const { return dims.empty() || data.empty(); }
+};
+
 /**
  * @brief Records the prefix cache match lengths for different instances on
  * current request

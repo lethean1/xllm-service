@@ -21,10 +21,12 @@ limitations under the License.
 #include <chrono>
 #include <iostream>
 #include <nlohmann/json.hpp>
+#include <unordered_set>
 
 #include "common/global_gflags.h"
 #include "common/types.h"
 #include "common/utils.h"
+#include "d2d_transmission_optimizer.h"
 
 namespace xllm_service {
 
@@ -36,6 +38,7 @@ static std::unordered_map<InstanceType, std::string> ETCD_KEYS_PREFIX_MAP = {
 };
 static std::string ETCD_ALL_KEYS_PREFIX = "XLLM:";
 static std::string ETCD_LOADMETRICS_PREFIX = "XLLM:LOADMETRICS:";
+static std::string ETCD_EXPERT_DIST_PREFIX = "XLLM:EXPERT_DIST:";
 
 InstanceMgr::InstanceMgr(const Options& options,
                          const std::shared_ptr<EtcdClient>& etcd_client,
@@ -57,6 +60,12 @@ InstanceMgr::InstanceMgr(const Options& options,
                                          std::placeholders::_1,
                                          std::placeholders::_2);
     etcd_client_->add_watch(ETCD_LOADMETRICS_PREFIX, handle_load_metrics);
+    auto handle_expert_dist =
+        std::bind(&InstanceMgr::update_expert_distribution,
+                  this,
+                  std::placeholders::_1,
+                  std::placeholders::_2);
+    etcd_client_->add_watch(ETCD_EXPERT_DIST_PREFIX, handle_expert_dist);
   }
 
   init();
@@ -142,6 +151,10 @@ void InstanceMgr::init() {
   {
     std::unique_lock<std::shared_mutex> lock(load_metric_mutex_);
     etcd_client_->get_prefix(ETCD_LOADMETRICS_PREFIX, &load_metrics_);
+  }
+  {
+    std::unique_lock<std::shared_mutex> lock(expert_dist_mutex_);
+    etcd_client_->get_prefix(ETCD_EXPERT_DIST_PREFIX, &expert_distributions_);
   }
 
   for (int i = 0; i < prefill_index_.size(); i++) {
@@ -312,9 +325,47 @@ bool InstanceMgr::upload_load_metrics() {
   return status;
 }
 
+void InstanceMgr::record_expert_distribution_update(
+    const std::string& instance_name,
+    const proto::ExpertDistribution& expert_distribution) {
+  std::lock_guard<std::mutex> lock(update_mutex_);
+  ExpertDistribution dist;
+  dist.dims = std::vector<int32_t>(expert_distribution.dims().begin(),
+                                   expert_distribution.dims().end());
+  dist.data = std::vector<int32_t>(expert_distribution.data().begin(),
+                                   expert_distribution.data().end());
+  auto now = std::chrono::system_clock::now();
+  auto timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          now.time_since_epoch())
+                          .count();
+  dist.timestamp_ms = timestamp_ms;
+  updated_expert_dists_.insert_or_assign(instance_name, std::move(dist));
+}
+
+bool InstanceMgr::upload_expert_distribution() {
+  std::lock_guard<std::mutex> lock(update_mutex_);
+  bool status =
+      etcd_client_->set(ETCD_EXPERT_DIST_PREFIX, updated_expert_dists_);
+  status =
+      status && etcd_client_->rm(ETCD_EXPERT_DIST_PREFIX, removed_instance_);
+  {
+    std::unique_lock<std::shared_mutex> lock(expert_dist_mutex_);
+    for (auto& iter : updated_expert_dists_) {
+      expert_distributions_.insert_or_assign(iter.first, std::move(iter.second));
+    }
+    for (auto& iter : removed_instance_) {
+      expert_distributions_.erase(iter);
+    }
+  }
+  updated_expert_dists_.clear();
+  removed_instance_.clear();
+  return status;
+}
+
 void InstanceMgr::set_as_master() {
   is_master_service_ = true;
   etcd_client_->remove_watch(ETCD_LOADMETRICS_PREFIX);
+  etcd_client_->remove_watch(ETCD_EXPERT_DIST_PREFIX);
 }
 
 std::shared_ptr<brpc::Channel> InstanceMgr::get_channel(
@@ -861,4 +912,176 @@ TimePredictor& InstanceMgr::get_time_predictor(
   return it->second;
 }
 
+void InstanceMgr::update_expert_distribution(const etcd::Response& response,
+                                             const uint64_t& prefix_len) {
+  if (response.events().empty() || exited_) {
+    return;
+  }
+  threadpool_.schedule([this,
+                        response = std::move(response),
+                        prefix_len = std::move(prefix_len)] {
+    if (exited_) return;
+    std::unordered_map<std::string, ExpertDistribution> put_map;
+    std::vector<std::string> delete_list;
+    for (const auto& event : response.events()) {
+      std::string instance_name = event.kv().key().substr(prefix_len);
+      if (event.event_type() == etcd::Event::EventType::PUT) {
+        ExpertDistribution dist;
+        auto json_str = event.kv().as_string();
+        if (!dist.parse_from_json(json_str)) {
+          LOG(ERROR) << "pase json:" << json_str << " error!";
+          continue;
+        }
+        put_map.insert(std::make_pair(instance_name, std::move(dist)));
+      } else if (event.event_type() == etcd::Event::EventType::DELETE_) {
+        delete_list.push_back(instance_name);
+      }
+    }
+    {
+      std::unique_lock<std::shared_mutex> lock(expert_dist_mutex_);
+      for (auto& iter : put_map) {
+        expert_distributions_.insert_or_assign(iter.first, std::move(iter.second));
+      }
+      for (auto& iter : delete_list) {
+        expert_distributions_.erase(iter);
+      }
+    }
+  });
+}
+
+InstanceMgr::D2DLayerPlan InstanceMgr::compute_d2d_plan_for_layer(
+    const std::string& target_instance_name,
+    int32_t layer_id) {
+  D2DLayerPlan layer_plan;
+  std::unordered_map<std::string, InstanceMetaInfo> instances_snapshot;
+  {
+    std::shared_lock<std::shared_mutex> lock(inst_mutex_);
+    instances_snapshot = instances_;
+  }
+  std::unordered_map<std::string, ExpertDistribution> dist_snapshot;
+  {
+    std::shared_lock<std::shared_mutex> lock(expert_dist_mutex_);
+    dist_snapshot = expert_distributions_;
+  }
+  std::vector<int> required_per_target;
+  std::vector<int32_t> dims_any;
+  for (auto& kv : dist_snapshot) {
+    if (!kv.second.dims.empty()) {
+      dims_any = kv.second.dims;
+      break;
+    }
+  }
+  if (dims_any.empty()) {
+    return layer_plan;
+  }
+  int device_num = 1;
+  int layer_num = dims_any[0];
+  if (layer_id < 0 || layer_id >= layer_num) {
+    return layer_plan;
+  }
+  if (dims_any.size() != 3) {
+    return layer_plan;
+  }
+  device_num = dims_any[1];
+  // 记录每个专家的源NPU
+  std::unordered_map<int, std::vector<D2DTransmissionOptimizer::GlobalNpu>> expert_to_src;
+  std::unordered_set<std::string> allowed_sources;
+  for (const auto& kv : dist_snapshot) {
+    if (kv.first != target_instance_name) {
+      allowed_sources.insert(kv.first);
+    }
+  }
+  if (allowed_sources.empty()) {
+    return layer_plan;
+  }
+  std::unordered_map<std::string, D2DTransmissionOptimizer::InstanceConfig> instance_configs;
+  for (auto& pair : dist_snapshot) {
+    if (!allowed_sources.empty() && allowed_sources.count(pair.first) == 0) {
+      continue;
+    }
+    auto& dist = pair.second;
+    if (dist.dims.empty() || dist.data.empty()) continue;
+    if (dist.dims.size() == 3) {
+      int layer_num = dist.dims[0];
+      int device_num = dist.dims[1];
+      int experts_per_device = dist.dims[2];
+      if (layer_id < 0 || layer_id >= layer_num) continue;
+      int base = layer_id * device_num * experts_per_device;
+      for (int d = 0; d < device_num; ++d) {
+        for (int e = 0; e < experts_per_device; ++e) {
+          int expert_id = dist.data[base + d * experts_per_device + e];
+          D2DTransmissionOptimizer::GlobalNpu gn;
+          gn.instance = pair.first;
+          gn.local_npu = d;
+          expert_to_src[expert_id].push_back(gn);
+        }
+      }
+
+      auto& cfg = instance_configs[pair.first];
+      cfg.device_size = device_num;
+      auto inst_it = instances_snapshot.find(pair.first);
+      if (inst_it != instances_snapshot.end()) {
+        if (inst_it->second.dp_size > 0) {
+          cfg.dp_size = inst_it->second.dp_size;
+        }
+      }
+    }
+  }
+  std::vector<int> unique_experts;
+  unique_experts.reserve(expert_to_src.size());
+  for (auto& kv : expert_to_src) {
+    unique_experts.push_back(kv.first);
+  }
+  required_per_target = std::move(unique_experts);
+  D2DTransmissionOptimizer opt;
+  auto steps = opt.optimize_layer(required_per_target, expert_to_src);
+  layer_plan.expert_steps.reserve(steps.size());
+  for (const auto& s : steps) {
+    D2DTransStep ts;
+    ts.src_instance = s.src.instance;
+    ts.src_npu = s.src.local_npu;
+    ts.expert_id = s.expert_id;
+    layer_plan.expert_steps.push_back(std::move(ts));
+  }
+
+  auto non_expert = opt.optimize_non_expert(steps, instance_configs);
+  if (!non_expert.src_instance.empty() && non_expert.dp_group_index >= 0) {
+    layer_plan.has_non_expert_step = true;
+    layer_plan.non_expert_step.src_instance = non_expert.src_instance;
+    layer_plan.non_expert_step.dp_group_index = non_expert.dp_group_index;
+    layer_plan.non_expert_step.start_npu_index = non_expert.start_npu_index;
+    layer_plan.non_expert_step.dp_size = non_expert.dp_size;
+  }
+
+  return layer_plan;
+}
+
+std::unordered_map<int32_t, InstanceMgr::D2DLayerPlan>
+InstanceMgr::compute_d2d_plan_for_instance(const std::string& target_instance_name) {
+  std::vector<int32_t> dims_any;
+  {
+    std::shared_lock<std::shared_mutex> lock(expert_dist_mutex_);
+    for (auto& kv : expert_distributions_) {
+      if (!kv.second.dims.empty()) {
+        dims_any = kv.second.dims;
+        break;
+      }
+    }
+  }
+  if (dims_any.empty()) {
+    return {};
+  }
+  int layer_num = 0;
+  if (dims_any.size() >= 1) {
+    layer_num = dims_any[0];
+  }
+  std::unordered_map<int32_t, D2DLayerPlan> result;
+  for (int l = 0; l < layer_num; ++l) {
+    auto plan = compute_d2d_plan_for_layer(target_instance_name, l);
+    if (!plan.expert_steps.empty() || plan.has_non_expert_step) {
+      result.insert_or_assign(static_cast<int32_t>(l), std::move(plan));
+    }
+  }
+  return result;
+}
 }  // namespace xllm_service

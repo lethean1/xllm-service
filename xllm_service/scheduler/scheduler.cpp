@@ -117,6 +117,7 @@ void Scheduler::update_master_service_heartbeat() {
 
     global_kvcache_mgr_->upload_kvcache();
 
+    instance_mgr_->upload_expert_distribution();
     instance_mgr_->upload_load_metrics();
   }
 }
@@ -128,6 +129,10 @@ void Scheduler::handle_instance_heartbeat(const proto::HeartbeatRequest* req) {
   global_kvcache_mgr_->record_updated_kvcaches(req->name(), req->cache_event());
   instance_mgr_->record_load_metrics_update(req->name(), req->load_metrics());
   instance_mgr_->update_latency_metrics(req->name(), req->latency_metrics());
+  if (req->has_expert_distribution()) {
+    instance_mgr_->record_expert_distribution_update(
+        req->name(), req->expert_distribution());
+  }
 }
 
 void Scheduler::handle_master_service_watch(const etcd::Response& response,
@@ -162,6 +167,11 @@ std::vector<std::string> Scheduler::get_static_decode_list(
 std::vector<std::string> Scheduler::get_static_prefill_list(
     const std::string& instance_name) {
   return instance_mgr_->get_static_prefill_list(instance_name);
+}
+  
+std::unordered_map<int32_t, InstanceMgr::D2DLayerPlan>
+Scheduler::get_d2d_plan_for_instance(const std::string& instance_name) {
+  return instance_mgr_->compute_d2d_plan_for_instance(instance_name);
 }
 
 Tokenizer* Scheduler::get_tls_tokenizer() {

@@ -81,6 +81,9 @@ class Scheduler final {
   void update_request_metrics_for_prefill(
       const std::string& service_request_id);
 
+  std::unordered_map<int32_t, InstanceMgr::D2DLayerPlan> get_d2d_plan_for_instance(
+      const std::string& instance_name);
+
  private:
   DISALLOW_COPY_AND_ASSIGN(Scheduler);
 

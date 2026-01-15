@@ -12,6 +12,24 @@ cc_binary(
 )
 
 cc_binary(
+  NAME
+    d2d_transmission_optimizer_example
+  SRCS
+    d2d_transmission_optimizer_example.cpp
+  DEPS
+    :managers
+)
+
+cc_binary(
+  NAME
+    d2d_transmission_test_more
+  SRCS
+    d2d_transmission_test_more.cpp
+  DEPS
+    :managers
+)
+
+cc_binary(
   NAME 
     rpc_client_test
   SRCS 
