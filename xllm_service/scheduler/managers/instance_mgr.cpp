@@ -289,7 +289,8 @@ void InstanceMgr::record_load_metrics_update(
   updated_metrics_.insert_or_assign(
       instance_name,
       LoadMetrics(load_metrics.waiting_requests_num(),
-                  load_metrics.gpu_cache_usage_perc()));
+                  load_metrics.gpu_cache_usage_perc(),
+                  load_metrics.offload_batch()));
 }
 
 bool InstanceMgr::upload_load_metrics() {
@@ -859,6 +860,15 @@ TimePredictor& InstanceMgr::get_time_predictor(
                << instance_name;
   }
   return it->second;
+}
+
+uint32_t InstanceMgr::get_offload_batch(const std::string& instance_name) {
+  std::shared_lock<std::shared_mutex> guard(load_metric_mutex_);
+  auto it = load_metrics_.find(instance_name);
+  if (it != load_metrics_.end()) {
+    return it->second.offload_batch;
+  }
+  return UINT32_MAX;
 }
 
 }  // namespace xllm_service

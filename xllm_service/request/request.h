@@ -55,6 +55,9 @@ struct Request {
   // the estimated TTFT obtained from the TTFT predictor
   int64_t estimated_ttft = 0;
 
+  // offload batch of decode instance
+  uint32_t offload_batch = UINT32_MAX;
+
   // output callback
   OutputCallback output_callback;
 
