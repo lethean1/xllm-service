@@ -79,17 +79,26 @@ enum class InstanceType : int8_t {
 };
 
 struct LoadMetrics {
-  LoadMetrics() : waiting_requests_num(0), gpu_cache_usage_perc(0) {};
-  LoadMetrics(const uint64_t& waiting_reqs_num, const float& usage)
-      : waiting_requests_num(waiting_reqs_num), gpu_cache_usage_perc(usage) {};
+  LoadMetrics()
+      : waiting_requests_num(0),
+        gpu_cache_usage_perc(0),
+        offload_batch(UINT32_MAX) {};
+  LoadMetrics(const uint64_t& waiting_reqs_num,
+              const float& usage,
+              const uint32_t& offload_batch_)
+      : waiting_requests_num(waiting_reqs_num),
+        gpu_cache_usage_perc(usage),
+        offload_batch(offload_batch_) {};
 
   uint64_t waiting_requests_num;
   float gpu_cache_usage_perc;
+  uint32_t offload_batch;
 
   nlohmann::json serialize_to_json() const {
     nlohmann::json json_val;
     json_val["waiting_requests_num"] = waiting_requests_num;
     json_val["gpu_cache_usage_perc"] = gpu_cache_usage_perc;
+    json_val["offload_batch"] = offload_batch;
     return json_val;
   }
 
@@ -102,6 +111,9 @@ struct LoadMetrics {
       waiting_requests_num =
           json_value.at("waiting_requests_num").get<uint64_t>();
       gpu_cache_usage_perc = json_value.at("gpu_cache_usage_perc").get<float>();
+      if (json_value.contains("offload_batch")) {
+        offload_batch = json_value.at("offload_batch").get<uint32_t>();
+      }
 
     } catch (const std::exception& e) {
       LOG(ERROR) << "json str:" << json_str

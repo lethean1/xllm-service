@@ -326,6 +326,9 @@ bool Scheduler::handle_generation(const llm::RequestOutput& request_output) {
 
     // update instance request metrics
     it->second->num_generated_tokens += 1;
+    if (it->second->num_generated_tokens == 1) {
+      it->second->offload_batch = instance_mgr_->get_offload_batch(it->second->routing.decode_name);
+    }
     instance_mgr_->update_request_metrics(it->second, RequestAction::GENERATE);
   }
 

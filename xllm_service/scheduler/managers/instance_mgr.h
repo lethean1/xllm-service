@@ -61,6 +61,8 @@ class InstanceMgr final {
                                   const proto::LoadMetrics& load_metrics);
   bool upload_load_metrics();
 
+  uint32_t get_offload_batch(const std::string& instance_name);
+
   // update the recent token latency metrics for the corresponding instance
   void update_latency_metrics(const std::string& instance_name,
                               const proto::LatencyMetrics& latency_metrics);
