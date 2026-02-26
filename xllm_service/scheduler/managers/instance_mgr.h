@@ -18,9 +18,11 @@ limitations under the License.
 #include <brpc/channel.h>
 
 #include <shared_mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "common/macros.h"
 #include "common/options.h"
@@ -32,12 +34,14 @@ limitations under the License.
 #include "xllm_rpc_service.pb.h"
 
 namespace xllm_service {
+class Scheduler;
 
 class InstanceMgr final {
  public:
   explicit InstanceMgr(const Options& options,
                        const std::shared_ptr<EtcdClient>& etcd_client,
-                       const bool is_master_service);
+                       const bool is_master_service,
+                       Scheduler* scheduler);
 
   ~InstanceMgr();
 
@@ -88,8 +92,31 @@ class InstanceMgr final {
   TimePredictor& get_time_predictor(const std::string& instance_name);
 
   void flip_prefill_to_decode(std::string& instance_name);
-
   void flip_decode_to_prefill(std::string& instance_name);
+
+  // Register a new instance with all necessary resources and connections
+  bool register_instance(const std::string& name, InstanceMetaInfo& info);
+  // Remove an instance and clean up its resources and connections
+  void deregister_instance(const std::string& name);
+  // Initialize internal resources for an instance (predictors, metrics)
+  void add_instance_resources(const std::string& name,
+                              const InstanceMetaInfo& info);
+  // Release internal resources for an instance
+  void remove_instance_resources(const std::string& name);
+  // Internal helper to establish bidirectional links with peer instances
+  bool link_instance_internal(const std::string& name, InstanceMetaInfo& info);
+  // Internal helper to break bidirectional links with peer instances
+  void unlink_instance_internal(const std::string& name,
+                                const InstanceMetaInfo& info);
+  // Add instance to prefill or decode index according to its type
+  void add_instance_to_index(const std::string& name, InstanceMetaInfo& info);
+  // Remove instance from prefill or decode index
+  void remove_instance_from_index(const std::string& name,
+                                  const InstanceMetaInfo& info);
+  bool call_link_instance(const std::string& target_rpc_addr,
+                          const InstanceMetaInfo& peer_info);
+  bool call_unlink_instance(const std::string& target_rpc_addr,
+                            const InstanceMetaInfo& peer_info);
 
  private:
   Options options_;
@@ -130,6 +157,10 @@ class InstanceMgr final {
   // token count, and decode request count.
   std::mutex request_metrics_mutex_;
   std::unordered_map<std::string, RequestMetrics> request_metrics_;
+
+  // not own
+  // NOTE: need to refactor with scheduler in future
+  Scheduler* scheduler_;
 
   ThreadPool threadpool_;
 };

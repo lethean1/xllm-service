@@ -21,8 +21,11 @@ limitations under the License.
 #include "loadbalance_policy/slo_aware_policy.h"
 #include "tokenizer/tokenizer_factory.h"
 
-static constexpr int kHeartbeatInterval = 3;  // in seconds
-static std::string ETCD_MASTER_SERVICE_KEY = "XLLM:SERVICE:MASTER";
+namespace {
+constexpr int32_t kHeartbeatInterval = 3;  // in seconds
+
+std::string ETCD_MASTER_SERVICE_KEY = "XLLM:SERVICE:MASTER";
+}  // namespace
 
 namespace xllm_service {
 
@@ -38,8 +41,8 @@ Scheduler::Scheduler(const Options& options) : options_(options) {
     LOG(INFO) << "Set current service as master!";
   }
 
-  instance_mgr_ =
-      std::make_unique<InstanceMgr>(options, etcd_client_, is_master_service_);
+  instance_mgr_ = std::make_unique<InstanceMgr>(
+      options, etcd_client_, is_master_service_, this);
 
   global_kvcache_mgr_ = std::make_shared<GlobalKVCacheMgr>(
       options, etcd_client_, is_master_service_);
@@ -181,7 +184,6 @@ bool Scheduler::record_new_request(std::shared_ptr<ChatCallData> call_data,
          model = request->model,
          stream = request->stream,
          include_usage = request->include_usage,
-         first_message_sent = std::unordered_set<size_t>(),
          service_request_id = request->service_request_id,
          created_time = absl::ToUnixSeconds(absl::Now())](
             const llm::RequestOutput& req_output) mutable -> bool {
@@ -193,19 +195,14 @@ bool Scheduler::record_new_request(std::shared_ptr<ChatCallData> call_data,
       }
 
       if (stream) {
-        return response_handler_.send_delta_to_client(call_data,
-                                                      &first_message_sent,
-                                                      include_usage,
-                                                      service_request_id,
-                                                      created_time,
-                                                      model,
-                                                      req_output);
+        return response_handler_.send_delta_to_client(
+            call_data, include_usage, created_time, model, req_output);
       }
 
       return response_handler_.send_result_to_client(
-          call_data, service_request_id, created_time, model, req_output);
+          call_data, created_time, model, req_output);
     };
-    requests_[request->service_request_id] = request;
+    requests_.emplace(request->service_request_id, request);
   }
 
   {
@@ -247,18 +244,14 @@ bool Scheduler::record_new_request(
       }
 
       if (stream) {
-        return response_handler_.send_delta_to_client(call_data,
-                                                      include_usage,
-                                                      service_request_id,
-                                                      created_time,
-                                                      model,
-                                                      req_output);
+        return response_handler_.send_delta_to_client(
+            call_data, include_usage, created_time, model, req_output);
       }
 
       return response_handler_.send_result_to_client(
-          call_data, service_request_id, created_time, model, req_output);
+          call_data, created_time, model, req_output);
     };
-    requests_[request->service_request_id] = request;
+    requests_.emplace(request->service_request_id, request);
   }
 
   {
@@ -294,6 +287,32 @@ void Scheduler::finish_request(const std::string& service_request_id,
   {
     std::lock_guard<std::mutex> guard(thread_map_mutex_);
     remote_requests_output_thread_map_.erase(service_request_id);
+  }
+}
+
+void Scheduler::clear_requests_on_failed_instance(
+    const std::string& instance_name,
+    InstanceType type) {
+  std::lock_guard<std::mutex> lock(request_mutex_);
+  for (auto it = requests_.begin(); it != requests_.end();) {
+    if ((type == InstanceType::PREFILL &&
+         it->second->routing.prefill_name == instance_name &&
+         !it->second->prefill_stage_finished) ||
+        (type == InstanceType::DECODE &&
+         it->second->routing.decode_name == instance_name)) {
+      auto service_request_id = it->second->service_request_id;
+      llm::RequestOutput req_output;
+      req_output.status = llm::Status(llm::StatusCode::CANCELLED,
+                                      "Instance is failed and deleted");
+      // call request callback
+      requests_[service_request_id]->output_callback(req_output);
+      LOG(INFO) << "Clear request on failed instance: " << instance_name
+                << " , service_request_id: " << service_request_id;
+      it = requests_.erase(it);
+      add_removed_request(service_request_id);
+    } else {
+      ++it;
+    }
   }
 }
 
@@ -336,6 +355,7 @@ bool Scheduler::handle_generation(const llm::RequestOutput& request_output) {
        request_output = std::move(request_output)]() mutable {
         if (!cb(request_output) || request_output.finished) {
           finish_request(service_request_id);
+          finish_request_context(service_request_id);
         }
       });
 
@@ -347,11 +367,63 @@ void Scheduler::update_request_metrics_for_prefill(
   std::lock_guard<std::mutex> guard(request_mutex_);
   auto it = requests_.find(service_request_id);
   if (it != requests_.end()) {
+    it->second->prefill_stage_finished = true;
     it->second->num_generated_tokens += 1;
     // update instance request metrics for prefill finished request
     instance_mgr_->update_request_metrics(it->second,
                                           RequestAction::FINISH_PREFILL);
   }
+}
+
+void Scheduler::register_request_rehandle_callback(RequestRehandleCallback cb) {
+  request_rehandle_cb_ = std::move(cb);
+}
+
+bool Scheduler::record_new_request_context(std::shared_ptr<RequestContext> req_context) {
+  std::lock_guard<std::mutex> guard(request_context_mutex_);
+  if (request_contexts_.find(req_context->request()->service_request_id) !=
+      request_contexts_.end()) {
+    LOG(ERROR)
+        << "The request context ID already exists. Requests with the same ID "
+           "are not allowed. "
+        << req_context->request()->service_request_id;
+    return false;
+  }
+  request_contexts_[req_context->request()->service_request_id] = req_context;
+  return true;
+}
+
+void Scheduler::finish_request_context(const std::string& service_request_id) {
+  LOG(INFO) << "Scheduler::finish_request_context for request id: "
+            << service_request_id;
+  {
+    std::lock_guard<std::mutex> guard(request_context_mutex_);
+    request_contexts_.erase(service_request_id);
+  }
+}
+
+void Scheduler::add_removed_request(std::string request) {
+  removed_requests_.push_back(request);
+}
+
+void Scheduler::rehandle_removed_request() {
+  if (removed_requests_.empty()) { return; }
+  
+  LOG(INFO) << "Rehandle removed requests";
+
+  while (!removed_requests_.empty()) {
+    std::string service_request_id = removed_requests_.front();
+
+    auto it = request_contexts_.find(service_request_id);
+
+    if (it != request_contexts_.end()) {
+      request_rehandle_cb_(it->second);
+    } else {
+      LOG(ERROR) << "Rehandle request NOT FOUND"
+                 << ", request id: " << service_request_id;
+    } 
+    removed_requests_.pop_front();  // 删除已处理的元素
+  }  
 }
 
 }  // namespace xllm_service

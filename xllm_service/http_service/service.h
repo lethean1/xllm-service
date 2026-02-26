@@ -30,6 +30,8 @@ limitations under the License.
 #include "request_tracer.h"
 #include "xllm_http_service.pb.h"
 
+#include "scheduler/request_context.h"
+
 namespace xllm_service {
 
 class Scheduler;
@@ -81,6 +83,10 @@ class XllmHttpServiceImpl : public proto::XllmHttpService {
               const std::string& req_attachment,
               std::shared_ptr<Request> request,
               const std::string& method);
+              
+  void handle(std::shared_ptr<RequestContext>);
+
+  void rehandle(std::shared_ptr<RequestContext>);
 
   void get_serving(const std::string& serving_method,
                    ::google::protobuf::RpcController* controller,
@@ -99,20 +105,6 @@ class XllmHttpServiceImpl : public proto::XllmHttpService {
   std::unique_ptr<RequestTracer> request_tracer_;
 
   std::unique_ptr<ThreadPool> thread_pool_;
-
-  // In disagg pd mode, we support receive generated token from
-  // prefill or from decode directly.
-  // 1.
-  // [service] ---req---> [prefill] ---req---> [decode]
-  // [service] <---first resp--- [prefill] ---first resp---> [decode]
-  // [service] <---resp--- [prefill] <---resp--- [decode]
-  //
-  // 2.
-  // [service] ---req---> [prefill] ---req---> [decode]
-  // [service] <---first resp-- [prefill] --first resp---> [decode]
-  // [service] <---resp-- [decode]
-  //
-  bool enable_decode_response_to_service_ = false;
 };
 
 }  // namespace xllm_service

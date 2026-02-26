@@ -51,12 +51,14 @@ std::string generate_service_request_id(const std::string& method) {
 XllmHttpServiceImpl::XllmHttpServiceImpl(const Options& options,
                                          Scheduler* scheduler)
     : options_(options), scheduler_(scheduler) {
-  enable_decode_response_to_service_ =
-      utils::get_bool_env("ENABLE_DECODE_RESPONSE_TO_SERVICE", false);
   initialized_ = true;
   thread_pool_ = std::make_unique<ThreadPool>(options_.num_threads());
   request_tracer_ =
       std::make_unique<RequestTracer>(options_.enable_request_trace());
+  scheduler_->register_request_rehandle_callback(
+      [this](std::shared_ptr<RequestContext> req_context) {
+        this->rehandle(req_context);
+      });
 }
 
 XllmHttpServiceImpl::~XllmHttpServiceImpl() {}
@@ -83,7 +85,8 @@ void handle_non_stream_response(brpc::Controller* cntl,
                                 std::shared_ptr<T> call_data) {
   std::unique_ptr<brpc::Controller> cntl_guard(cntl);
   if (cntl->Failed()) {
-    LOG(WARNING) << "Fail to send stream generation, " << cntl->ErrorText();
+    call_data->finish_with_error(cntl->ErrorText());
+    LOG(ERROR) << "Fail to send stream generation, " << cntl->ErrorText();
     return;
   }
   call_data->write_and_finish(cntl->response_attachment().to_string());
@@ -95,19 +98,88 @@ void handle_first_response(brpc::Controller* cntl,
                            Scheduler* scheduler,
                            std::string service_request_id,
                            bool stream) {
-  // update request metrics for prefill finished request
-  scheduler->update_request_metrics_for_prefill(service_request_id);
-
   std::unique_ptr<brpc::Controller> cntl_guard(cntl);
   if (cntl->Failed()) {
-    LOG(WARNING) << "Fail to send stream generation, " << cntl->ErrorText();
+    LOG(ERROR) << "Fail to send stream generation, " << cntl->ErrorText();
+    call_data->finish_with_error(cntl->ErrorText());
+    scheduler->finish_request(service_request_id, /*error*/ true);
     return;
   }
+
   if (stream) {
     // write first token from prefill
-    call_data->write(cntl->response_attachment().to_string());
+    std::string response = cntl->response_attachment().to_string();
+    // check response for stream request to handle error in prefill instance
+    // Currently, 1.response with "data:" prefix means no error and return the
+    // first token 2.empty response means the first token can not directly
+    // generate characters
+    if (!response.empty()) {
+      if (response.find("data:") != 0) {
+        LOG(ERROR) << "Fail in the prefill instance, " << response;
+        call_data->finish_with_error(response);
+        scheduler->finish_request(service_request_id, /*error*/ true);
+        return;
+      }
+      call_data->write(response);
+    }
   }
   // non-stream, all generated tokens will be sent from decode via rpc service.
+  // non-stream, all error in prefill instance will be handled through
+  // cntrl->setFailed()
+
+  // update request metrics for prefill finished request
+  scheduler->update_request_metrics_for_prefill(service_request_id);
+}
+
+void handle_first_response(brpc::Controller* cntl,
+                           std::shared_ptr<RequestContext> req_context,
+                           Scheduler* scheduler) {
+  auto service_request_id = req_context->request()->service_request_id;
+  auto attempt = req_context->attempt();
+  auto stream = req_context->request()->stream;
+  std::unique_ptr<brpc::Controller> cntl_guard(cntl);
+  if (cntl->Failed()) {
+    LOG(ERROR) << "Fail to send stream generation, " << cntl->ErrorText();
+    req_context->finish_with_error(cntl->ErrorText());
+    scheduler->finish_request(service_request_id, /*error*/ true);
+    scheduler->finish_request_context(service_request_id);
+    return;
+  }
+
+  if (attempt != req_context->attempt()) {
+    LOG(INFO) << "Request has been rehandled"
+              << ", service_request_id: " << service_request_id
+              << ", attempt: " << attempt;
+    return;
+  }
+  
+  LOG(INFO) << "First response"
+            << ", service_request_id: " << service_request_id;
+  
+  if (stream) {
+    // write first token from prefill
+    std::string response = cntl->response_attachment().to_string();
+    // check response for stream request to handle error in prefill instance
+    // Currently, 1.response with "data:" prefix means no error and return the
+    // first token 2.empty response means the first token can not directly
+    // generate characters
+    if (!response.empty()) {
+      if (response.find("data:") != 0) {
+        LOG(ERROR) << "Fail in the prefill instance, " << response;
+        req_context->finish_with_error(response);
+        scheduler->finish_request(service_request_id, /*error*/ true);
+        scheduler->finish_request_context(service_request_id);
+        return;
+      }
+      req_context->write(response);
+    }
+  }
+  // non-stream, all generated tokens will be sent from decode via rpc service.
+  // non-stream, all error in prefill instance will be handled through
+  // cntrl->setFailed()
+
+  // update request metrics for prefill finished request
+  scheduler->update_request_metrics_for_prefill(service_request_id);
 }
 
 template <typename T>
@@ -148,15 +220,13 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
                                  const std::string& req_attachment,
                                  std::shared_ptr<Request> request,
                                  const std::string& method) {
-  // record request when enable_decode_response_to_service.
-  if (enable_decode_response_to_service_) {
-    bool success = scheduler_->record_new_request(call_data, request);
-    if (!success) {
-      LOG(ERROR) << "rpc service add new request error: "
-                 << request->service_request_id;
-      call_data->finish_with_error("Internal runtime error.");
-      return;
-    }
+  // record request
+  bool success = scheduler_->record_new_request(call_data, request);
+  if (!success) {
+    LOG(ERROR) << "rpc service add new request error: "
+               << request->service_request_id;
+    call_data->finish_with_error("Internal runtime error.");
+    return;
   }
 
   // async redistribute the request and wait the response
@@ -178,62 +248,106 @@ void XllmHttpServiceImpl::handle(std::shared_ptr<T> call_data,
     // redirect the input request content
     redirect_cntl->request_attachment().append(req_attachment);
 
-    // 1. tokens will be received via rpc channel.
-    //
-    if (enable_decode_response_to_service_) {
-      google::protobuf::Closure* done =
-          brpc::NewCallback(&handle_first_response<T>,
-                            redirect_cntl,
-                            call_data,
-                            scheduler_,
-                            request->service_request_id,
-                            request->stream);
-      channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, done);
-      if (redirect_cntl->Failed()) {
-        LOG(ERROR) << "Redirect to instance error: "
-                   << redirect_cntl->ErrorText();
-        call_data->finish_with_error(redirect_cntl->ErrorText());
-        scheduler_->finish_request(request->service_request_id, /*error=*/true);
-        delete done;
-        delete redirect_cntl;
-        return;
-      }
-      return;
-    }
-
-    // 2. tokens will be received via http channel.
-    //
-    if (request->stream) {
-      // receive tokens in progressive mode.
-      redirect_cntl->response_will_be_read_progressively();
-
-      // Because `done'(last parameter) is NULL, this function waits until
-      // the response comes back or error occurs(including timeout).
-      channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, NULL);
-      if (redirect_cntl->Failed()) {
-        LOG(ERROR) << "Redirect to instance error: "
-                   << redirect_cntl->ErrorText();
-        call_data->finish_with_error(redirect_cntl->ErrorText());
-        delete redirect_cntl;
-        return;
-      }
-      auto reader = new CustomProgressiveReader<T>(redirect_cntl, call_data);
-      // redirect_cntl and reader will be deleted in CustomProgressiveReader.
-      redirect_cntl->ReadProgressiveAttachmentBy(reader);
-    } else {
-      google::protobuf::Closure* done = brpc::NewCallback(
-          &handle_non_stream_response<T>, redirect_cntl, call_data);
-      channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, done);
-      if (redirect_cntl->Failed()) {
-        LOG(ERROR) << "Redirect to instance error: "
-                   << redirect_cntl->ErrorText();
-        call_data->finish_with_error(redirect_cntl->ErrorText());
-        delete done;
-        delete redirect_cntl;
-        return;
-      }
-    }
+    // tokens will be received via rpc channel.
+    google::protobuf::Closure* done =
+        brpc::NewCallback(&handle_first_response<T>,
+                          redirect_cntl,
+                          call_data,
+                          scheduler_,
+                          request->service_request_id,
+                          request->stream);
+    channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, done);
+    return;
   });
+}
+
+void XllmHttpServiceImpl::handle(std::shared_ptr<RequestContext> req_context) {
+  LOG(INFO) << "Handle request"
+            << ", service_request_id: " << req_context->request()->service_request_id;
+
+  bool success = false;
+  if (auto call_data = req_context->call_data_as<CompletionCallData>()) {
+    success = scheduler_->record_new_request(call_data, req_context->request());
+  } else if (auto call_data = req_context->call_data_as<ChatCallData>()) {
+    success = scheduler_->record_new_request(call_data, req_context->request());
+  }
+  
+  if (!success) {
+    LOG(ERROR) << "rpc service add new request error: "
+               << req_context->request()->service_request_id;
+    req_context->finish_with_error("Internal runtime error.");
+    return;
+  }
+
+  // async redistribute the request and wait the response
+  // TODO: optimize the thread pool to async mode.
+  auto& target_uri = req_context->request()->routing.prefill_name;
+  brpc::Channel* channel_ptr = scheduler_->get_channel(target_uri).get();
+
+  auto method = req_context->method();
+  // send request to prefill instance.
+  thread_pool_->schedule([this,
+                          req_context,
+                          channel_ptr,
+                          target_uri = target_uri + method]() {
+    brpc::Controller* redirect_cntl = new brpc::Controller();
+    redirect_cntl->http_request().uri() = target_uri.c_str();
+    redirect_cntl->http_request().set_method(brpc::HTTP_METHOD_POST);
+
+    // redirect the input request content
+    redirect_cntl->request_attachment().append(req_context->req_attachment()->c_str());
+
+    // tokens will be received via rpc channel.
+    google::protobuf::Closure* done =
+        brpc::NewCallback(&handle_first_response,
+                          redirect_cntl,
+                          req_context,
+                          scheduler_);
+    channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, done);
+    return;
+  });
+}
+
+void XllmHttpServiceImpl::rehandle(std::shared_ptr<RequestContext> req_context) {
+  LOG(INFO) << "Rehandle request"
+            << ", request id: " << req_context->request()->service_request_id
+            << ", attempt: " << req_context->attempt();
+  
+  auto req_pb = req_context->request_message();
+  std::string attachment = std::move(*req_context->req_attachment());
+  std::string error;
+  if (!json2pb::JsonToProtoMessage(attachment, req_pb, &error)) {
+    LOG(ERROR) << "Parse json to proto failed: " << error;
+    return;
+  }
+
+  // LOG(INFO) << req_pb->DebugString();
+
+  req_context->request()->routing.prefill_name = "";
+  req_context->request()->routing.decode_name = "";
+
+  if (!scheduler_->schedule(req_context->request())) {
+    LOG(ERROR) << "Schedule request failed!";
+    req_context->finish_with_error("Schedule request failed!");
+    return;
+  }
+
+  req_pb->mutable_routing()->set_prefill_name(
+      req_context->request()->routing.prefill_name);
+  req_pb->mutable_routing()->set_decode_name(
+      req_context->request()->routing.decode_name);
+
+  std::string req_attachment;
+  
+  if (!json2pb::ProtoMessageToJson(*req_pb, &req_attachment, &error)) {
+    LOG(ERROR) << "Parse proto to json failed: " << error;
+    req_context->finish_with_error(error);
+    return;
+  }
+  req_context->set_req_attachment(std::make_shared<std::string>(req_attachment));
+  req_context->increment_attempt();
+
+  handle(req_context);
 }
 
 template <typename T>
@@ -273,7 +387,8 @@ void handle_get_response(brpc::Controller* cntl,
   std::unique_ptr<brpc::Controller> cntl_guard(cntl);
   std::unique_ptr<google::protobuf::Closure> done_guard(done);
   if (cntl->Failed()) {
-    LOG(WARNING) << "Fail to send stream generation, " << cntl->ErrorText();
+    LOG(ERROR) << "Fail to send stream generation, " << cntl->ErrorText();
+    call_data->finish_with_error(cntl->ErrorText());
     return;
   }
   call_data->write_and_finish(cntl->response_attachment().to_string());
@@ -325,13 +440,6 @@ void XllmHttpServiceImpl::get_serving(
         // Because `done'(last parameter) is NULL, this function waits until
         // the response comes back or error occurs(including timeout).
         channel_ptr->CallMethod(NULL, redirect_cntl, NULL, NULL, done);
-        if (redirect_cntl->Failed()) {
-          LOG(ERROR) << "Redirect to instance error: "
-                     << redirect_cntl->ErrorText();
-          call_data->finish_with_error(redirect_cntl->ErrorText());
-          delete done;
-          delete redirect_cntl;
-        }
       });
 }
 
@@ -352,10 +460,10 @@ void XllmHttpServiceImpl::Completions(
 
   auto arena = response->GetArena();
   auto req_pb =
-      google::protobuf::Arena::CreateMessage<llm::proto::CompletionRequest>(
+      google::protobuf::Arena::CreateMessage<::xllm::proto::CompletionRequest>(
           arena);
   auto resp_pb =
-      google::protobuf::Arena::CreateMessage<llm::proto::CompletionResponse>(
+      google::protobuf::Arena::CreateMessage<::xllm::proto::CompletionResponse>(
           arena);
 
   std::string attachment = std::move(cntl->request_attachment().to_string());
@@ -401,7 +509,17 @@ void XllmHttpServiceImpl::Completions(
 
   auto call_data = std::make_shared<CompletionCallData>(
       cntl, service_request->stream, done_guard.release(), resp_pb);
-  handle(call_data, req_attachment, service_request, "/v1/completions");
+  // handle(call_data, req_attachment, service_request, "/v1/completions");
+  
+  auto req_context = std::make_shared<RequestContext>(
+      req_pb, // 重复利用 arena 中的 protomessage
+      call_data,
+      std::make_shared<std::string>(req_attachment),
+      service_request, "/v1/completions", nullptr);
+
+  scheduler_->record_new_request_context(req_context);
+  
+  handle(req_context);
 }
 
 void XllmHttpServiceImpl::ChatCompletions(
@@ -421,9 +539,10 @@ void XllmHttpServiceImpl::ChatCompletions(
 
   auto arena = response->GetArena();
   auto req_pb =
-      google::protobuf::Arena::CreateMessage<llm::proto::ChatRequest>(arena);
+      google::protobuf::Arena::CreateMessage<::xllm::proto::ChatRequest>(arena);
   auto resp_pb =
-      google::protobuf::Arena::CreateMessage<llm::proto::ChatResponse>(arena);
+      google::protobuf::Arena::CreateMessage<::xllm::proto::ChatResponse>(
+          arena);
 
   std::string attachment = std::move(cntl->request_attachment().to_string());
   std::string error;

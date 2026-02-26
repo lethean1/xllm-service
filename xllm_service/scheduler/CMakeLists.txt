@@ -10,6 +10,7 @@ cc_library(
   HDRS
     response_handler.h
     scheduler.h
+    request_context.h
   SRCS
     response_handler.cpp
     scheduler.cpp

@@ -17,8 +17,36 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_MESSAGE_LOG_LEVEL STATUS)
 set(CMAKE_VERBOSE_MAKEFILE ON)
 
-if (USE_ASCEND)
-    add_compile_options(-D_GLIBCXX_USE_CXX11_ABI=0)
+set(CHECK_TORCH_ABI_SCRIPT
+"
+import torch
+print(0 if not torch.compiled_with_cxx11_abi() else 1)
+"
+)
+
+execute_process(
+    COMMAND python -c "${CHECK_TORCH_ABI_SCRIPT}"
+    OUTPUT_VARIABLE TORCH_CXX11_ABI_VALUE
+    OUTPUT_STRIP_TRAILING_WHITESPACE 
+    RESULT_VARIABLE TORCH_ABI_CHECK_RESULT
+)
+
+if(NOT TORCH_ABI_CHECK_RESULT EQUAL 0)
+    message(WARNING "Failed to detect PyTorch CXX11 ABI! "
+            "Reason: ${TORCH_ABI_CHECK_RESULT}\n"
+            "Fallback to _GLIBCXX_USE_CXX11_ABI=0 (default)")
+    set(TORCH_CXX11_ABI_VALUE 0)
+else()
+    message(STATUS "Detected PyTorch CXX11 ABI: ${TORCH_CXX11_ABI_VALUE} "
+            "(0=OFF, 1=ON)")
+endif()
+
+if(TORCH_CXX11_ABI_VALUE EQUAL 0)
+    set(USE_CXX11_ABI OFF)
+    add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=0)
+else()
+    set(USE_CXX11_ABI ON)
+    add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=1)
 endif()
 
 # Set default build type
@@ -50,7 +78,8 @@ endif()
 
 # configure vcpkg
 # have to set CMAKE_TOOLCHAIN_FILE before first project call.
-if (DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+# if (DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+if (DEFINED ENV{VCPKG_ROOT})
   set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
       CACHE STRING "Vcpkg toolchain file")
   message(STATUS "VCPKG_ROOT found, using vcpkg at $ENV{VCPKG_ROOT}")

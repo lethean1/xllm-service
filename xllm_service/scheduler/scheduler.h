@@ -29,7 +29,11 @@ limitations under the License.
 #include "tokenizer/tokenizer.h"
 #include "tokenizer/tokenizer_args.h"
 
+#include "scheduler/request_context.h"
+
 namespace xllm_service {
+    
+using RequestRehandleCallback = std::function<void(std::shared_ptr<RequestContext>)>;
 
 // A scheduler for scheduling requests and instances
 class Scheduler final {
@@ -63,12 +67,27 @@ class Scheduler final {
   void finish_request(const std::string& service_request_id,
                       bool error = false);
 
+  void clear_requests_on_failed_instance(const std::string& instance_name,
+                                         InstanceType type);
+
   // handle generations from prefill/decode instance
   bool handle_generation(const llm::RequestOutput& request_output);
 
   // update request metrics for prefill finished request
   void update_request_metrics_for_prefill(
       const std::string& service_request_id);
+
+  void register_request_rehandle_callback(RequestRehandleCallback cb);
+
+  bool record_new_request_context(std::shared_ptr<RequestContext> req_context);
+
+  void finish_request_context(const std::string& service_request_id);
+  
+  void add_removed_request(std::string);
+
+  std::optional<std::string> pop_first_removed_request();
+
+  void rehandle_removed_request();
 
  private:
   DISALLOW_COPY_AND_ASSIGN(Scheduler);
@@ -119,6 +138,16 @@ class Scheduler final {
 
   // used when receive token from decode instance.
   ResponseHandler response_handler_;
+
+  //
+  RequestRehandleCallback request_rehandle_cb_;
+
+  // 
+  std::unordered_map<std::string, std::shared_ptr<RequestContext>> request_contexts_;
+  std::mutex request_context_mutex_;
+
+  // used when removed request need rehandle.
+  std::deque<std::string> removed_requests_{};
 };
 
 }  // namespace xllm_service

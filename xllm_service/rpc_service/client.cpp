@@ -17,10 +17,12 @@ limitations under the License.
 
 #include <glog/logging.h>
 
-namespace xllm_service {
-
+namespace {
 // magic number, TODO: move to config file or env var
-static constexpr int kHeartbeatInterval = 3;  // in seconds
+constexpr int32_t kHeartbeatInterval = 3;  // in seconds
+}  // namespace
+
+namespace xllm_service {
 
 XllmRpcClient::XllmRpcClient(const std::string& instace_name,
                              const std::string& master_addr,
@@ -92,6 +94,25 @@ ErrorCode XllmRpcClient::register_instance(const InstanceMetaInfo& metainfo) {
     req.set_type(proto::InstanceType::MIX);
   } else {
     req.set_type(proto::InstanceType::DEFAULT);
+  }
+  for (auto& cluster_id : metainfo.cluster_ids) {
+    *(req.mutable_cluster_ids()->Add()) = cluster_id;
+  }
+  for (auto& addr : metainfo.addrs) {
+    *(req.mutable_addrs()->Add()) = addr;
+  }
+  for (auto& k_cache_id : metainfo.k_cache_ids) {
+    *(req.mutable_k_cache_ids()->Add()) = k_cache_id;
+  }
+  for (auto& v_cache_id : metainfo.v_cache_ids) {
+    *(req.mutable_v_cache_ids()->Add()) = v_cache_id;
+  }
+  req.set_dp_size(metainfo.dp_size);
+  for (auto& ip : metainfo.device_ips) {
+    *(req.mutable_device_ips()->Add()) = ip;
+  }
+  for (auto& port : metainfo.ports) {
+    req.add_ports(port);
   }
   proto::StatusCode res;
   master_stub_->RegisterInstance(&cntl, &req, &res, nullptr);
